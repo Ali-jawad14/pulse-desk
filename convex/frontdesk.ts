@@ -96,7 +96,7 @@ export const commitQualifiedIntake = mutation({
   handler: async (
     ctx,
     args
-  ): Promise<{ leadId: Id<"leads">; bookedSlotLabel?: string }> => {
+  ): Promise<{ leadId: Id<"leads">; bookedSlotLabel?: string; finalReply: string }> => {
     const now = Date.now();
 
     let bookedSlotLabel: string | undefined = undefined;
@@ -157,7 +157,7 @@ export const commitQualifiedIntake = mutation({
       timestamp: now + 1,
     });
 
-    return { leadId, bookedSlotLabel };
+    return { leadId, bookedSlotLabel, finalReply };
   },
 });
 
@@ -167,28 +167,39 @@ export const processInboundInquiry = action({
     message: v.string(),
     channel: v.string(),
     autoBook: v.boolean(),
+    conversationContext: v.optional(v.string()),
   },
   handler: async (
     ctx,
     args
-  ): Promise<{ leadId: Id<"leads">; bookedSlotLabel?: string }> => {
+  ): Promise<{ leadId: Id<"leads">; bookedSlotLabel?: string; aiReply: string }> => {
     const geminiKey = process.env.GEMINI_API_KEY;
     const groqKey = process.env.GROQ_API_KEY;
 
-    const systemPrompt = `You are an AI Front Desk for BrightSmile Dental & Wellness Clinic (Austin, TX).
-Analyze the inbound prospect message and extract structured CRM fields as valid JSON ONLY (no markdown fences).
+    const systemPrompt = `You are an AI Front Desk Receptionist for BrightSmile Dental & Wellness Clinic (Austin, TX).
+Analyze the latest inbound message (and optional conversation history) and extract structured CRM fields as valid JSON ONLY (no markdown fences).
+
+STRICT QUALIFICATION SCORING RULES (CRITICAL):
+- 0 to 25 (Disqualified / Non-Booking): Greetings only ("hi", "hey", "hello"), explicit refusals ("i don't want an appointment", "no thanks", "stop"), or B2B/vendor spam pitches. NEVER score these 65 or higher.
+- 30 to 60 (Needs Follow-Up): User asks a general question or mentions a symptom without stating they want to book, OR hasn't shared what dental service they need yet. Ask a helpful clarifying question in "aiReply" without booking.
+- 65 to 100 (Qualified for Auto-Booking): User clearly states a dental need/service AND wants to book/schedule an appointment (or describes urgent dental pain/emergency care).
+
 Schema:
 {
-  "patientName": "string (infer or 'New Caller')",
+  "patientName": "string (infer from message/history or 'New Caller')",
   "contactInfo": "string (phone/email if present, else '(512) 555-0194')",
-  "serviceRequested": "string (e.g., 'Emergency Crown Repair', 'New Patient Exam', 'Invisalign Consult', 'General Inquiry')",
+  "serviceRequested": "string (e.g., 'Emergency Crown Repair', 'Routine Cleaning', 'Invisalign Consult', 'General Greeting / No Booking')",
   "urgency": "Emergency | High | Routine",
   "insuranceProvider": "string (e.g., 'Delta Dental PPO', 'Cigna', 'Self-Pay', 'Unverified')",
-  "qualificationScore": number (0-100 based on clear clinical need, decision intent, and commercial viability),
+  "qualificationScore": number,
   "status": "Qualified & Booked | Needs Follow-Up | Disqualified",
   "aiSummary": "1-sentence crisp CRM note for the clinic coordinator",
-  "aiReply": "Warm, concise 2-sentence SMS/chat response confirming insurance/service without mentioning the exact time slot yet"
+  "aiReply": "Natural, warm, conversational 1-2 sentence response tailored directly to what the user just said. Do NOT invent or mention an appointment slot in aiReply."
 }`;
+
+    const userPayload = args.conversationContext
+      ? `Recent conversation:\n${args.conversationContext}\n\nLatest Inbound (${args.channel}): "${args.message}"`
+      : `Inbound (${args.channel}): "${args.message}"`;
 
     let parsed: {
       patientName: string;
@@ -215,7 +226,7 @@ Schema:
             response_format: { type: "json_object" },
             messages: [
               { role: "system", content: systemPrompt },
-              { role: "user", content: `Inbound (${args.channel}): "${args.message}"` },
+              { role: "user", content: userPayload },
             ],
           }),
         });
@@ -229,11 +240,7 @@ Schema:
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
-              contents: [
-                {
-                  parts: [{ text: `${systemPrompt}\n\nInbound (${args.channel}): "${args.message}"` }],
-                },
-              ],
+              contents: [{ parts: [{ text: `${systemPrompt}\n\n${userPayload}` }] }],
               generationConfig: { responseMimeType: "application/json" },
             }),
           }
@@ -247,7 +254,13 @@ Schema:
     }
 
     if (!parsed) {
-      const lower = args.message.toLowerCase();
+      const lower = args.message.toLowerCase().trim();
+      const isRefusal =
+        lower.includes("don't want") ||
+        lower.includes("dont want") ||
+        lower.includes("no thanks") ||
+        lower.includes("cancel");
+      const isGreetingOnly = ["hi", "hey", "hello", "yo", "hola"].includes(lower.replace(/[!?.]/g, ""));
       const isUrgent =
         lower.includes("pain") ||
         lower.includes("broke") ||
@@ -257,14 +270,21 @@ Schema:
         lower.includes("seo") ||
         lower.includes("marketing agency") ||
         lower.includes("unsubscribe");
+
+      const nonBooking = isRefusal || isGreetingOnly || isSpam;
+
       parsed = {
         patientName: lower.includes("sarah")
           ? "Sarah Miller"
           : lower.includes("david")
           ? "David Chen"
-          : "Jordan Taylor",
+          : "New Visitor",
         contactInfo: "(512) 555-0182",
-        serviceRequested: isUrgent
+        serviceRequested: isRefusal
+          ? "Declined Appointment"
+          : isGreetingOnly
+          ? "Initial Greeting"
+          : isUrgent
           ? "Emergency Crown / Pain Relief"
           : isSpam
           ? "Vendor Solicitation"
@@ -275,18 +295,26 @@ Schema:
           : lower.includes("aetna")
           ? "Aetna PPO"
           : "Self-Pay / Unverified",
-        qualificationScore: isSpam ? 10 : isUrgent ? 94 : 78,
-        status: isSpam ? "Disqualified" : "Needs Follow-Up",
-        aiSummary: isSpam
+        qualificationScore: nonBooking ? 15 : isUrgent ? 94 : 78,
+        status: nonBooking ? "Disqualified" : "Needs Follow-Up",
+        aiSummary: isRefusal
+          ? "Visitor stated they do not want an appointment."
+          : isGreetingOnly
+          ? "Visitor sent an opening greeting without specifying a dental need."
+          : isSpam
           ? "Outbound B2B vendor pitch filtered out automatically."
           : `Inbound ${args.channel} lead requesting ${isUrgent ? "urgent" : "standard"} dental care.`,
-        aiReply: isSpam
+        aiReply: isRefusal
+          ? "No problem at all! If you ever need dental care or have questions in the future, just reach out."
+          : isGreetingOnly
+          ? "Hi there! How can BrightSmile Dental help you today—are you looking to schedule a visit or ask a question?"
+          : isSpam
           ? "Thanks for reaching out, though we aren't looking for outside vendor services right now."
-          : "Hi! Thanks for contacting BrightSmile Dental—we accept most major PPO plans including Delta Dental and would love to get you taken care of.",
+          : "Hi! Thanks for contacting BrightSmile Dental—we accept most major PPO plans and would love to get you taken care of.",
       };
     }
 
-    const result: { leadId: Id<"leads">; bookedSlotLabel?: string } =
+    const result: { leadId: Id<"leads">; bookedSlotLabel?: string; finalReply: string } =
       await ctx.runMutation(api.frontdesk.commitQualifiedIntake, {
         prospectMessage: args.message,
         channel: args.channel,
@@ -294,6 +322,10 @@ Schema:
         autoBookSlot: args.autoBook,
       });
 
-    return result;
+    return {
+      leadId: result.leadId,
+      bookedSlotLabel: result.bookedSlotLabel,
+      aiReply: result.finalReply,
+    };
   },
 });

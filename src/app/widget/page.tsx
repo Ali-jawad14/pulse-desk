@@ -31,6 +31,11 @@ export default function PublicPatientWidget() {
     const trimmed = input.trim();
     if (!trimmed || sending) return;
 
+    const historyContext = chat
+      .slice(-4)
+      .map((m) => `${m.sender === "patient" ? "Patient" : "Receptionist"}: ${m.text}`)
+      .join("\n");
+
     setChat((prev) => [...prev, { sender: "patient", text: trimmed }]);
     setInput("");
     setSending(true);
@@ -40,15 +45,14 @@ export default function PublicPatientWidget() {
         message: trimmed,
         channel: "Public Web Widget",
         autoBook: true,
+        conversationContext: historyContext,
       });
 
       setChat((prev) => [
         ...prev,
         {
           sender: "ai",
-          text: res.bookedSlotLabel
-            ? `You're all set! I've qualified your request and confirmed your appointment for ${res.bookedSlotLabel}.`
-            : "Thanks for reaching out! Our front-desk coordinator has logged your details and will follow up shortly.",
+          text: res.aiReply,
           bookedSlot: res.bookedSlotLabel,
         },
       ]);
