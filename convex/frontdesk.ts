@@ -1,6 +1,6 @@
 import { v } from "convex/values";
-import { action, mutation, query } from "./_generated/server";
-import { api } from "./_generated/api";
+import { action, internalQuery, mutation, query } from "./_generated/server";
+import { api, internal } from "./_generated/api";
 import { Id } from "./_generated/dataModel";
 
 // 1. REACTIVE QUERIES (Auto-update React UI in real time)
@@ -26,6 +26,16 @@ export const getDashboardState = query({
       appointments,
       messages: messages.reverse(),
     };
+  },
+});
+
+export const getOpenSlotsInternal = internalQuery({
+  args: {},
+  handler: async (ctx) => {
+    return await ctx.db
+      .query("appointments")
+      .withIndex("by_isBooked", (q) => q.eq("isBooked", false))
+      .collect();
   },
 });
 
@@ -92,6 +102,7 @@ export const commitQualifiedIntake = mutation({
     aiSummary: v.string(),
     aiReply: v.string(),
     autoBookSlot: v.boolean(),
+    preferredSlotLabel: v.optional(v.string()),
   },
   handler: async (
     ctx,
@@ -103,14 +114,18 @@ export const commitQualifiedIntake = mutation({
     let targetSlotId: Id<"appointments"> | undefined = undefined;
 
     if (args.autoBookSlot && args.qualificationScore >= 65) {
-      const openSlot = await ctx.db
+      const openSlots = await ctx.db
         .query("appointments")
         .withIndex("by_isBooked", (q) => q.eq("isBooked", false))
-        .first();
+        .collect();
 
-      if (openSlot) {
-        bookedSlotLabel = openSlot.slotLabel;
-        targetSlotId = openSlot._id;
+      const matchedSlot = args.preferredSlotLabel
+        ? openSlots.find((s) => s.slotLabel === args.preferredSlotLabel)
+        : openSlots[0];
+
+      if (matchedSlot) {
+        bookedSlotLabel = matchedSlot.slotLabel;
+        targetSlotId = matchedSlot._id;
       }
     }
 
@@ -161,7 +176,7 @@ export const commitQualifiedIntake = mutation({
   },
 });
 
-// 3. AI ACTION (Calls Groq/Gemini LLM API, then commits via ACID mutation)
+// 3. AI ACTION (Reads live open slots, calls Groq/Gemini, commits via ACID mutation)
 export const processInboundInquiry = action({
   args: {
     message: v.string(),
@@ -176,25 +191,46 @@ export const processInboundInquiry = action({
     const geminiKey = process.env.GEMINI_API_KEY;
     const groqKey = process.env.GROQ_API_KEY;
 
-    const systemPrompt = `You are an AI Front Desk Receptionist for BrightSmile Dental & Wellness Clinic (Austin, TX).
-Analyze the latest inbound message (and optional conversation history) and extract structured CRM fields as valid JSON ONLY (no markdown fences).
+    const openSlots = await ctx.runQuery(internal.frontdesk.getOpenSlotsInternal);
+    const openSlotLabels = openSlots.map((s) => s.slotLabel);
 
-STRICT QUALIFICATION SCORING RULES (CRITICAL):
-- 0 to 25 (Disqualified / Non-Booking): Greetings only ("hi", "hey", "hello"), explicit refusals ("i don't want an appointment", "no thanks", "stop"), or B2B/vendor spam pitches. NEVER score these 65 or higher.
-- 30 to 60 (Needs Follow-Up): User asks a general question or mentions a symptom without stating they want to book, OR hasn't shared what dental service they need yet. Ask a helpful clarifying question in "aiReply" without booking.
-- 65 to 100 (Qualified for Auto-Booking): User clearly states a dental need/service AND wants to book/schedule an appointment (or describes urgent dental pain/emergency care).
+    const combinedText = `${args.conversationContext ?? ""}\n${args.message}`.toLowerCase();
+    const lower = args.message.toLowerCase().trim();
+
+    const isRefusal =
+      lower.includes("don't want") ||
+      lower.includes("dont want") ||
+      lower.includes("no thanks") ||
+      lower.includes("cancel");
+    const isSpam =
+      lower.includes("seo") ||
+      lower.includes("marketing agency") ||
+      lower.includes("unsubscribe");
+
+    const systemPrompt = `You are an AI Front Desk Receptionist for BrightSmile Dental & Wellness Clinic (Austin, TX).
+Currently available appointment slots: ${openSlotLabels.length > 0 ? openSlotLabels.join(", ") : "None available"}.
+
+Analyze the latest inbound message and conversation history, then return valid JSON ONLY (no markdown fences).
+
+STRICT SCHEDULING & SCORING RULES:
+- 0 to 25 (Disqualified): Greetings only ("hi", "hey"), vague intros without a dental need, explicit refusals ("i don't want an appointment"), or vendor spam.
+- 30 to 60 (Needs Follow-Up):
+  1) User asks for a time window that does NOT exist in available slots (for example, requesting "evening" when only morning/afternoon slots up to 04:15 PM exist). Do NOT book a mismatched slot—explain our latest slot is 04:15 PM and ask if an afternoon slot works!
+  2) User asks to book without specifying what dental service they need yet.
+- 65 to 100 (Qualified & Ready to Book): User specifies a clear dental need/service AND wants an appointment matching one of the available slots. Pick the exact matching string from available slots for "preferredSlotLabel".
 
 Schema:
 {
-  "patientName": "string (infer from message/history or 'New Caller')",
+  "patientName": "string (infer from message or conversation history, else 'New Visitor')",
   "contactInfo": "string (phone/email if present, else '(512) 555-0194')",
-  "serviceRequested": "string (e.g., 'Emergency Crown Repair', 'Routine Cleaning', 'Invisalign Consult', 'General Greeting / No Booking')",
+  "serviceRequested": "string",
   "urgency": "Emergency | High | Routine",
   "insuranceProvider": "string (e.g., 'Delta Dental PPO', 'Cigna', 'Self-Pay', 'Unverified')",
   "qualificationScore": number,
   "status": "Qualified & Booked | Needs Follow-Up | Disqualified",
-  "aiSummary": "1-sentence crisp CRM note for the clinic coordinator",
-  "aiReply": "Natural, warm, conversational 1-2 sentence response tailored directly to what the user just said. Do NOT invent or mention an appointment slot in aiReply."
+  "preferredSlotLabel": "exact string from available slots if qualificationScore >= 65, else empty string",
+  "aiSummary": "1-sentence crisp CRM note",
+  "aiReply": "Natural, direct 1-2 sentence response addressing their exact request and slot availability."
 }`;
 
     const userPayload = args.conversationContext
@@ -209,6 +245,7 @@ Schema:
       insuranceProvider: string;
       qualificationScore: number;
       status: string;
+      preferredSlotLabel?: string;
       aiSummary: string;
       aiReply: string;
     } | null = null;
@@ -219,7 +256,7 @@ Schema:
           method: "POST",
           headers: {
             "Content-Type": "application/json",
-            Authorization: `Bearer ${groqKey}`,
+            Authorization: `Bearer ${groqKey.trim()}`,
           },
           body: JSON.stringify({
             model: "llama-3.3-70b-versatile",
@@ -231,11 +268,14 @@ Schema:
           }),
         });
         const data = await res.json();
+        if (!res.ok) {
+          console.error("Groq HTTP error:", res.status, JSON.stringify(data));
+        }
         const rawText = data?.choices?.[0]?.message?.content;
         if (rawText) parsed = JSON.parse(rawText);
       } else if (geminiKey) {
         const res = await fetch(
-          `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${geminiKey}`,
+          `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${geminiKey.trim()}`,
           {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -254,72 +294,108 @@ Schema:
     }
 
     if (!parsed) {
-      const lower = args.message.toLowerCase().trim();
-      const isRefusal =
-        lower.includes("don't want") ||
-        lower.includes("dont want") ||
-        lower.includes("no thanks") ||
-        lower.includes("cancel");
-      const isGreetingOnly = ["hi", "hey", "hello", "yo", "hola"].includes(lower.replace(/[!?.]/g, ""));
+      const isGreetingOnly = ["hi", "hey", "hello", "yo", "hola"].includes(
+        lower.replace(/[!?.]/g, "")
+      );
+      const wantsEvening = lower.includes("evening") || lower.includes("night");
+      const wantsAfternoon = lower.includes("afternoon") || lower.includes("pm");
       const isUrgent =
         lower.includes("pain") ||
         lower.includes("broke") ||
+        lower.includes("cracked") ||
         lower.includes("emergency") ||
         lower.includes("crown");
-      const isSpam =
-        lower.includes("seo") ||
-        lower.includes("marketing agency") ||
-        lower.includes("unsubscribe");
+      const hasCareType =
+        isUrgent ||
+        lower.includes("clean") ||
+        lower.includes("invisalign") ||
+        lower.includes("tooth") ||
+        lower.includes("checkup") ||
+        lower.includes("consult");
+      const hasBookingVerb =
+        lower.includes("book") || lower.includes("appointment") || lower.includes("schedule");
+
+      const inferredName = combinedText.includes("sarah")
+        ? "Sarah Miller"
+        : combinedText.includes("david")
+        ? "David Chen"
+        : combinedText.includes("ali")
+        ? "Ali"
+        : "New Visitor";
 
       const nonBooking = isRefusal || isGreetingOnly || isSpam;
 
+      // Match slot time window if available
+      const afternoonSlot = openSlotLabels.find((s) => s.includes("PM"));
+      const morningSlot = openSlotLabels.find((s) => s.includes("AM"));
+      const chosenSlot = wantsAfternoon ? afternoonSlot ?? morningSlot : morningSlot ?? afternoonSlot;
+
+      let score = 45;
+      let reply =
+        "Hi there! How can BrightSmile Dental help you today—what dental service are you looking for?";
+
+      if (isRefusal) {
+        score = 10;
+        reply = "No problem at all! If you ever need dental care or have questions later, just reach out.";
+      } else if (isSpam) {
+        score = 10;
+        reply = "Thanks for reaching out, though we aren't looking for outside vendor services right now.";
+      } else if (wantsEvening) {
+        score = 52;
+        reply = `Our clinic closes after our 04:15 PM slot, so we don't have evening appointments—would ${afternoonSlot ?? "Tomorrow · 02:00 PM EST"} work for you instead, and what service do you need?`;
+      } else if (hasBookingVerb && !hasCareType) {
+        score = 55;
+        reply = `I'd be happy to get you scheduled${inferredName !== "New Visitor" ? `, ${inferredName}` : ""}! What dental service do you need (e.g., exam & cleaning, tooth pain, or Invisalign)?`;
+      } else if (isUrgent || (hasBookingVerb && hasCareType)) {
+        score = isUrgent ? 94 : 80;
+        reply = `Thanks${inferredName !== "New Visitor" ? `, ${inferredName}` : ""}! We accept most major PPO plans and have you covered.`;
+      }
+
       parsed = {
-        patientName: lower.includes("sarah")
-          ? "Sarah Miller"
-          : lower.includes("david")
-          ? "David Chen"
-          : "New Visitor",
+        patientName: inferredName,
         contactInfo: "(512) 555-0182",
         serviceRequested: isRefusal
           ? "Declined Appointment"
-          : isGreetingOnly
-          ? "Initial Greeting"
           : isUrgent
           ? "Emergency Crown / Pain Relief"
-          : isSpam
-          ? "Vendor Solicitation"
-          : "Comprehensive Exam & Cleaning",
+          : hasCareType
+          ? "Comprehensive Exam & Cleaning"
+          : "General Scheduling Inquiry",
         urgency: isUrgent ? "Emergency" : "Routine",
-        insuranceProvider: lower.includes("delta")
+        insuranceProvider: combinedText.includes("delta")
           ? "Delta Dental PPO"
-          : lower.includes("aetna")
+          : combinedText.includes("aetna")
           ? "Aetna PPO"
           : "Self-Pay / Unverified",
-        qualificationScore: nonBooking ? 15 : isUrgent ? 94 : 78,
-        status: nonBooking ? "Disqualified" : "Needs Follow-Up",
-        aiSummary: isRefusal
-          ? "Visitor stated they do not want an appointment."
-          : isGreetingOnly
-          ? "Visitor sent an opening greeting without specifying a dental need."
-          : isSpam
-          ? "Outbound B2B vendor pitch filtered out automatically."
-          : `Inbound ${args.channel} lead requesting ${isUrgent ? "urgent" : "standard"} dental care.`,
-        aiReply: isRefusal
-          ? "No problem at all! If you ever need dental care or have questions in the future, just reach out."
-          : isGreetingOnly
-          ? "Hi there! How can BrightSmile Dental help you today—are you looking to schedule a visit or ask a question?"
-          : isSpam
-          ? "Thanks for reaching out, though we aren't looking for outside vendor services right now."
-          : "Hi! Thanks for contacting BrightSmile Dental—we accept most major PPO plans and would love to get you taken care of.",
+        qualificationScore: nonBooking ? 15 : score,
+        status: nonBooking ? "Disqualified" : score >= 65 ? "Qualified & Booked" : "Needs Follow-Up",
+        preferredSlotLabel: score >= 65 ? chosenSlot : "",
+        aiSummary: `Inbound ${args.channel} message from ${inferredName}.`,
+        aiReply: reply,
       };
+    }
+
+    if (isRefusal || isSpam) {
+      parsed.qualificationScore = 10;
+      parsed.status = "Disqualified";
+      parsed.preferredSlotLabel = "";
     }
 
     const result: { leadId: Id<"leads">; bookedSlotLabel?: string; finalReply: string } =
       await ctx.runMutation(api.frontdesk.commitQualifiedIntake, {
         prospectMessage: args.message,
         channel: args.channel,
-        ...parsed,
+        patientName: parsed.patientName,
+        contactInfo: parsed.contactInfo,
+        serviceRequested: parsed.serviceRequested,
+        urgency: parsed.urgency,
+        insuranceProvider: parsed.insuranceProvider,
+        qualificationScore: parsed.qualificationScore,
+        status: parsed.status,
+        aiSummary: parsed.aiSummary,
+        aiReply: parsed.aiReply,
         autoBookSlot: args.autoBook,
+        preferredSlotLabel: parsed.preferredSlotLabel || undefined,
       });
 
     return {
